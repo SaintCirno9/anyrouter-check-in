@@ -60,7 +60,7 @@ jobs:
 
     - name: 安装 CloakBrowser
       run: |
-        uv run python -m cloakbrowser install
+        xvfb-run uv run python -m cloakbrowser install || [ -f ~/.cloakbrowser/*/chrome ]
         echo "✅ CloakBrowser 安装完成"
 
     - name: 恢复余额历史缓存
