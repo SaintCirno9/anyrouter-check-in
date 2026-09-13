@@ -234,25 +234,69 @@ async def login_with_credentials(
 		return None
 
 
+def is_session_expired(status_code: int, text: str = '', data: dict | None = None) -> bool:
+	"""判断是否为 Session 登录态过期或失效"""
+	if status_code == 401:
+		if text and ('<html' in text.lower() or '<!doctype' in text.lower()):
+			return False
+		return True
+
+	if data and isinstance(data, dict):
+		msg = str(data.get('message') or data.get('msg') or data.get('error') or '').lower()
+		keywords = ['未登录', '登录已过期', '请先登录', '登录失效', 'session expired', 'not logged in', 'token invalid', 'unauthorized', '不匹配']
+		if any(kw in msg for kw in keywords):
+			return True
+
+	if text and not ('<html' in text.lower() or '<!doctype' in text.lower()):
+		keywords = ['未登录', '登录已过期', '请先登录', 'session expired', 'unauthorized']
+		if any(kw in text.lower() for kw in keywords):
+			return True
+
+	return False
+
+
 def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
 		response = client.get(user_info_url, headers=headers, timeout=30)
 
 		if response.status_code == 200:
-			data = response.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				quota = round(user_data.get('quota', 0) / 500000, 2)
-				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+			try:
+				data = response.json()
+			except Exception:
+				data = None
+
+			if data and isinstance(data, dict):
+				if data.get('success'):
+					user_data = data.get('data', {})
+					quota = round(user_data.get('quota', 0) / 500000, 2)
+					used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+					return {
+						'success': True,
+						'quota': quota,
+						'used_quota': used_quota,
+						'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+					}
+				msg = str(data.get('message') or data.get('msg') or data.get('error') or '')
+				expired = is_session_expired(response.status_code, response.text, data)
+				err_label = 'Session 已过期或失效' if expired else 'Failed to get user info'
 				return {
-					'success': True,
-					'quota': quota,
-					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+					'success': False,
+					'error': f'{err_label}: {msg or "API returned failure"}',
+					'session_expired': expired,
 				}
+
+			msg = response.text[:200].strip() if response.text else ''
+			return {'success': False, 'error': f'Failed to get user info: Expecting value or WAF challenge ({msg})'}
+
+		expired = is_session_expired(response.status_code, response.text)
+		err_label = 'Session 已过期或失效' if expired else 'Failed to get user info'
 		msg = response.text[:200].strip() if response.text else ''
-		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code} ({msg})'}
+		return {
+			'success': False,
+			'error': f'{err_label}: HTTP {response.status_code} ({msg})',
+			'session_expired': expired,
+		}
 	except Exception as e:
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:100]}...'}
 
@@ -456,6 +500,10 @@ def run_check_in_requests(
 			elif user_info_before:
 				print(user_info_before.get('error', 'Unknown error'))
 
+			if user_info_before and user_info_before.get('session_expired'):
+				print(f'[EXPIRED] {account_name}: ⚠️ 检测到登录 Session 已过期或失效！')
+				return False, user_info_before, user_info_before
+
 			if provider_config.needs_manual_check_in():
 				success = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
@@ -466,12 +514,60 @@ def run_check_in_requests(
 				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
 				return True, user_info_before, user_info_after
 			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
+			if user_info_after and user_info_after.get('session_expired'):
+				print(f'[EXPIRED] {account_name}: ⚠️ 检测到登录 Session 已过期或失效！')
 			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
 			return False, user_info_before, user_info_after
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
 		return False, None, None
+
+
+async def check_in_account_with_retry(
+	account: AccountConfig,
+	account_index: int,
+	app_config: AppConfig,
+	max_retries: int = 2,
+	retry_delay: int = 10,
+) -> tuple[bool, dict | None, dict | None]:
+	"""带失败自动重试与过期拦截的账号签到执行器"""
+	account_name = account.get_display_name(account_index)
+	last_result = (False, None, None)
+
+	for attempt in range(1, max_retries + 1):
+		if attempt > 1:
+			print(f'\n[RETRY] {account_name}: 等待 {retry_delay} 秒后进行第 {attempt}/{max_retries} 次重试...')
+			await asyncio.sleep(retry_delay)
+
+		success, user_info_before, user_info_after = await check_in_account(account, account_index, app_config)
+		last_result = (success, user_info_before, user_info_after)
+
+		if success:
+			if attempt > 1:
+				print(f'[SUCCESS] {account_name}: 第 {attempt} 次重试签到成功！')
+			return success, user_info_before, user_info_after
+
+		# 检查是否为 Session 登录态过期
+		is_expired = False
+		if user_info_after and user_info_after.get('session_expired'):
+			is_expired = True
+		elif user_info_before and user_info_before.get('session_expired'):
+			is_expired = True
+
+		if is_expired:
+			print(f'[EXPIRED] {account_name}: 登录 Session 已失效，停止重试以避免无效请求。')
+			break
+
+		if attempt < max_retries:
+			error_reason = (
+				(user_info_after.get('error') if user_info_after else None)
+				or (user_info_before.get('error') if user_info_before else None)
+				or '签到未成功'
+			)
+			print(f'[WARN] {account_name}: 第 {attempt} 次尝试未成功 ({error_reason})，准备稍后重试。')
+
+	return last_result
 
 
 async def main():
@@ -514,10 +610,15 @@ async def main():
 	need_notify = False
 	balance_changed = False
 
+	max_retries = int(os.getenv('CHECKIN_MAX_RETRIES', '2'))
+	retry_delay = int(os.getenv('CHECKIN_RETRY_DELAY', '10'))
+
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
 		try:
-			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
+			success, user_info_before, user_info_after = await check_in_account_with_retry(
+				account, i, app_config, max_retries=max_retries, retry_delay=retry_delay
+			)
 			if success:
 				success_count += 1
 
@@ -561,12 +662,23 @@ async def main():
 
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)
-				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
-				if user_info_after and user_info_after.get('success'):
-					account_result += f'\n{user_info_after["display"]}'
-				elif user_info_after:
-					account_result += f'\n{user_info_after.get("error", "Unknown error")}'
+				is_expired = bool(
+					(user_info_after and user_info_after.get('session_expired'))
+					or (user_info_before and user_info_before.get('session_expired'))
+				)
+				if is_expired:
+					status = '[EXPIRED]'
+					account_result = f'{status} ⚠️ {account_name}: 登录 Session 已过期！请在网页端重新登录获取 Cookie 更新'
+					err = (user_info_after and user_info_after.get('error')) or (user_info_before and user_info_before.get('error'))
+					if err:
+						account_result += f'\n  详情: {err}'
+				else:
+					status = '[SUCCESS]' if success else '[FAIL]'
+					account_result = f'{status} {account_name}'
+					if user_info_after and user_info_after.get('success'):
+						account_result += f'\n{user_info_after["display"]}'
+					elif user_info_after:
+						account_result += f'\n{user_info_after.get("error", "Unknown error")}'
 				notification_content.append(account_result)
 
 		except Exception as e:
@@ -615,6 +727,10 @@ async def main():
 		else:
 			summary.append('[ERROR] All accounts check-in failed')
 
+		has_expired = any('EXPIRED' in item for item in notification_content)
+		if has_expired:
+			summary.append('[ALERT] ⚠️ 检测到有账号 Session 已过期，请尽快在本地更新凭据')
+
 		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
 		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
@@ -631,7 +747,8 @@ async def main():
 			notify_content += f'\n\n{screenshot_hint}'
 
 		print(notify_content)
-		notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
+		notify_title = 'AnyRouter Check-in Alert ⚠️ [Session 过期提示]' if has_expired else 'AnyRouter Check-in Alert'
+		notify.push_message(notify_title, notify_content, msg_type='text')
 		print('[NOTIFY] Notification sent due to failures or balance changes')
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
